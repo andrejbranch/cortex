@@ -2,6 +2,8 @@ module github.com/cortexproject/cortex
 
 go 1.14
 
+replace github.com/prometheus/prometheus => github.com/andrejbranch/prometheus v1.8.2-0.20210208224900-7a6421874001
+
 require (
 	cloud.google.com/go/bigtable v1.2.0
 	cloud.google.com/go/storage v1.10.0
