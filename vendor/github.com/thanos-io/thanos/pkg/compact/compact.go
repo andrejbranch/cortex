@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -206,6 +208,8 @@ type Grouper interface {
 	// Groups returns the compaction groups for all blocks currently known to the syncer.
 	// It creates all groups from the scratch on every call.
 	Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Group, err error)
+	StartGroup(group *Group)
+	CompleteGroup(group *Group)
 }
 
 // DefaultGroupKey returns a unique identifier for the group the block belongs to, based on
@@ -232,6 +236,9 @@ type DefaultGrouper struct {
 	verticalCompactions      *prometheus.CounterVec
 	garbageCollectedBlocks   prometheus.Counter
 	blocksMarkedForDeletion  prometheus.Counter
+	planner                  Planner
+	planned                  map[ulid.ULID]bool
+	plannedMtx               sync.Mutex
 }
 
 // NewDefaultGrouper makes a new DefaultGrouper.
@@ -243,6 +250,7 @@ func NewDefaultGrouper(
 	reg prometheus.Registerer,
 	blocksMarkedForDeletion prometheus.Counter,
 	garbageCollectedBlocks prometheus.Counter,
+	planner Planner,
 ) *DefaultGrouper {
 	return &DefaultGrouper{
 		bkt:                      bkt,
@@ -271,7 +279,25 @@ func NewDefaultGrouper(
 		}, []string{"group"}),
 		garbageCollectedBlocks:  garbageCollectedBlocks,
 		blocksMarkedForDeletion: blocksMarkedForDeletion,
+		planner:                 planner,
+		planned:                 map[ulid.ULID]bool{},
 	}
+}
+
+func (g *DefaultGrouper) StartGroup(group *Group) {
+	g.plannedMtx.Lock()
+	for _, m := range group.metasByMinTime {
+		g.planned[m.ULID] = true
+	}
+	g.plannedMtx.Unlock()
+}
+
+func (g *DefaultGrouper) CompleteGroup(group *Group) {
+	g.plannedMtx.Lock()
+	for _, m := range group.metasByMinTime {
+		delete(g.planned, m.ULID)
+	}
+	g.plannedMtx.Unlock()
 }
 
 // Groups returns the compaction groups for all blocks currently known to the syncer.
@@ -279,6 +305,9 @@ func NewDefaultGrouper(
 func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Group, err error) {
 	groups := map[string]*Group{}
 	for _, m := range blocks {
+		if _, ok := g.planned[m.ULID]; ok {
+			continue
+		}
 		groupKey := DefaultGroupKey(m.Thanos)
 		group, ok := groups[groupKey]
 		if !ok {
@@ -287,6 +316,7 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 				log.With(g.logger, "group", fmt.Sprintf("%d@%v", m.Thanos.Downsample.Resolution, lbls.String()), "groupKey", groupKey),
 				g.bkt,
 				groupKey,
+				"",
 				lbls,
 				m.Thanos.Downsample.Resolution,
 				g.acceptMalformedIndex,
@@ -309,6 +339,54 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 			return nil, errors.Wrap(err, "add compaction group")
 		}
 	}
+
+	if g.planner != nil {
+		newGroups := []*Group{}
+		// split each group by available plans
+		var seededRand *rand.Rand = rand.New(
+			rand.NewSource(time.Now().UnixNano()))
+		for _, group := range res {
+			for toCompact, err := g.planner.Plan(context.Background(), group.metasByMinTime); len(toCompact) != 0; toCompact, err = g.planner.Plan(context.Background(), group.metasByMinTime) {
+				if err != nil {
+					return nil, errors.Wrap(err, "split group")
+				}
+				lbls := group.Labels()
+				hash := strconv.Itoa(seededRand.Int())
+				groupKey := group.Key()
+				newGroup, err := NewGroup(
+					log.With(g.logger, "split group", fmt.Sprintf("%d@%v", group.Resolution(), lbls.String()), "groupKey", groupKey, "hash", hash),
+					g.bkt,
+					groupKey,
+					hash,
+					lbls,
+					group.Resolution(),
+					g.acceptMalformedIndex,
+					g.enableVerticalCompaction,
+					g.compactions.WithLabelValues(groupKey),
+					g.compactionRunsStarted.WithLabelValues(groupKey),
+					g.compactionRunsCompleted.WithLabelValues(groupKey),
+					g.compactionFailures.WithLabelValues(groupKey),
+					g.verticalCompactions.WithLabelValues(groupKey),
+					g.garbageCollectedBlocks,
+					g.blocksMarkedForDeletion,
+				)
+				if err != nil {
+					return nil, errors.Wrap(err, "create compaction group")
+				}
+				newGroups = append(newGroups, newGroup)
+				for _, m := range toCompact {
+					newGroup.Add(m)
+					for i, mm := range group.metasByMinTime {
+						if mm.ULID == m.ULID {
+							group.metasByMinTime = append(group.metasByMinTime[:i], group.metasByMinTime[i+1:]...)
+						}
+					}
+				}
+			}
+		}
+		res = newGroups
+	}
+
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].Key() < res[j].Key()
 	})
@@ -321,6 +399,7 @@ type Group struct {
 	logger                      log.Logger
 	bkt                         objstore.Bucket
 	key                         string
+	hash                        string
 	labels                      labels.Labels
 	resolution                  int64
 	mtx                         sync.Mutex
@@ -341,6 +420,7 @@ func NewGroup(
 	logger log.Logger,
 	bkt objstore.Bucket,
 	key string,
+	hash string,
 	lset labels.Labels,
 	resolution int64,
 	acceptMalformedIndex bool,
@@ -360,6 +440,7 @@ func NewGroup(
 		logger:                      logger,
 		bkt:                         bkt,
 		key:                         key,
+		hash:                        hash,
 		labels:                      lset,
 		resolution:                  resolution,
 		acceptMalformedIndex:        acceptMalformedIndex,
@@ -378,6 +459,11 @@ func NewGroup(
 // Key returns an identifier for the group.
 func (cg *Group) Key() string {
 	return cg.key
+}
+
+// Hash returns an identifier for ths sub group.
+func (cg *Group) Hash() string {
+	return cg.hash
 }
 
 // Add the block with the given meta to the group.
@@ -450,7 +536,7 @@ func (cg *Group) Resolution() int64 {
 
 // Planner returns blocks to compact.
 type Planner interface {
-	// Plan returns a block directories of blocks that should be compacted into single one.
+	// Plan returns a list of blocks that should be compacted into single one.
 	// The blocks can be overlapping. The provided metadata has to be ordered by minTime.
 	Plan(ctx context.Context, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error)
 }
@@ -479,7 +565,7 @@ type Compactor interface {
 func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp Compactor) (shouldRerun bool, compID ulid.ULID, rerr error) {
 	cg.compactionRunsStarted.Inc()
 
-	subDir := filepath.Join(dir, cg.Key())
+	subDir := filepath.Join(dir, cg.Key()+"-"+cg.Hash())
 
 	defer func() {
 		if IsHaltError(rerr) {
@@ -693,10 +779,7 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		overlappingBlocks = true
 	}
 
-	toCompact, err := planner.Plan(ctx, cg.metasByMinTime)
-	if err != nil {
-		return false, ulid.ULID{}, errors.Wrap(err, "plan compaction")
-	}
+	toCompact := cg.metasByMinTime
 	if len(toCompact) == 0 {
 		// Nothing to do.
 		return false, ulid.ULID{}, nil
@@ -904,7 +987,9 @@ func (c *BucketCompactor) Compact(ctx context.Context) (rerr error) {
 			go func() {
 				defer wg.Done()
 				for g := range groupChan {
+					c.grouper.StartGroup(g)
 					shouldRerunGroup, _, err := g.Compact(workCtx, c.compactDir, c.planner, c.comp)
+					c.grouper.CompleteGroup(g)
 					if err == nil {
 						if shouldRerunGroup {
 							mtx.Lock()

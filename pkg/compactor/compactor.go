@@ -552,6 +552,7 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		reg,
 		c.blocksMarkedForDeletion,
 		c.garbageCollectedBlocks,
+		c.tsdbPlanner,
 	)
 
 	compactor, err := compact.NewBucketCompactor(
