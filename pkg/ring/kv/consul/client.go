@@ -142,6 +142,9 @@ func (c *Client) cas(ctx context.Context, key string, f func(in interface{}) (ou
 		// Get with default options - don't want stale data to compare with
 		options := &consul.QueryOptions{}
 		kvp, _, err := c.kv.Get(key, options.WithContext(ctx))
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		if err != nil {
 			level.Error(util.Logger).Log("msg", "error getting key", "key", key, "err", err)
 			continue
